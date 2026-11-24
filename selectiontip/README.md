@@ -20,7 +20,7 @@ Depois de instalar, reinicie o LibreOffice.
   listener global de documentos e conecta um `ViewWatcher` a cada view do Calc.
 - Em cada mudança de seleção: contagem pelos endereços dos intervalos, soma via
   `XSheetOperation.computeFunction` (código nativo do Calc, o mesmo da barra
-  de status), e formatação com o formato numérico da primeira célula.
+  de status), formatada com 2 casas decimais e separador de milhar (ex.: `1.234,50`).
 - A posição vem de `VisibleArea` (1/100 mm) → `VisibleAreaOnScreen` (pixels),
   ancorada no canto inferior direito da última célula, presa à área visível.
 - O balão some ao clicar, ao trocar de janela, ao selecionar uma única célula

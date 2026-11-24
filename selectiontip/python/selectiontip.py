@@ -16,6 +16,7 @@ Design notes (performance):
 import os
 import threading
 import traceback
+from decimal import Decimal, ROUND_HALF_UP
 
 import uno
 import unohelper
@@ -41,6 +42,7 @@ PAD_X, PAD_Y = 6, 3       # inner padding of the tooltip
 _BORDER = uno.getConstantByName("com.sun.star.awt.WindowAttribute.BORDER")
 
 
+_CENTS = Decimal("0.01")
 _LOG = os.environ.get("SELECTIONTIP_LOG")
 
 
@@ -85,7 +87,6 @@ class ViewWatcher(unohelper.Base, XSelectionChangeListener,
         self.on_dispose = on_dispose
         self.tip = None
         self.label = None
-        self.formatter = None
         self.last_key = None
         self.generation = 0
         self.async_cb = None
@@ -166,15 +167,14 @@ class ViewWatcher(unohelper.Base, XSelectionChangeListener,
         t.start()
 
     # ------------------------------------------------------------- formatting
-    def _format(self, value, first_cell):
-        try:
-            if self.formatter is None:
-                self.formatter = self.ctx.ServiceManager.createInstanceWithContext(
-                    "com.sun.star.util.NumberFormatter", self.ctx)
-                self.formatter.attachNumberFormatsSupplier(self.ctrl.Model)
-            return self.formatter.convertNumberToString(first_cell.NumberFormat, value)
-        except Exception:
-            return ("%.10g" % value)
+    @staticmethod
+    def _format(value):
+        """1234567.891 -> '1.234.567,89' (2 decimals, pt-BR separators)."""
+        d = Decimal(repr(value)).quantize(_CENTS, rounding=ROUND_HALF_UP)
+        if d == 0:
+            d = abs(d)                     # avoid "-0,00"
+        s = "{:,.2f}".format(d)            # '1,234,567.89'
+        return s.replace(",", "\x00").replace(".", ",").replace("\x00", ".")
 
     # ---------------------------------------------------------------- geometry
     def _anchor_px(self, sheet, addr):
@@ -228,9 +228,7 @@ class ViewWatcher(unohelper.Base, XSelectionChangeListener,
         sheet = self.ctrl.ActiveSheet
         numbers = sel.computeFunction(COUNTNUMS)
         if numbers > 0:
-            total = sel.computeFunction(SUM)
-            first = sheet.getCellByPosition(addrs[0].StartColumn, addrs[0].StartRow)
-            text += "   Soma: " + self._format(total, first)
+            text += "   Soma: " + self._format(sel.computeFunction(SUM))
 
         anchor = self._anchor_px(sheet, addrs[-1])
         if anchor is None:
