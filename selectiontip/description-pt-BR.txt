@@ -1,0 +1,1 @@
+Mostra, ao lado da seleção no Calc, um balão com a quantidade de células selecionadas e a soma dos valores numéricos.
