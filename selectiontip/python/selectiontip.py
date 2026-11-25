@@ -11,10 +11,13 @@ Design notes (performance):
     in Calc's C++ core (same code path as the status bar), so even whole
     columns are cheap.
   * The tooltip window is created once per view and only moved/re-labelled.
+  * The sum's format comes from a single cell, never from scanning the range.
+  * Auto-hide uses at most one (sleeping) thread per view.
 """
 
 import os
 import threading
+import time
 import traceback
 from decimal import Decimal, ROUND_HALF_UP
 
@@ -29,6 +32,8 @@ from com.sun.star.awt import (XEnhancedMouseClickHandler, XTopWindowListener,
 from com.sun.star.awt.WindowClass import TOP, SIMPLE
 from com.sun.star.awt.PosSize import POSSIZE
 from com.sun.star.sheet.GeneralFunction import SUM, COUNTNUMS
+from com.sun.star.table.CellContentType import EMPTY, TEXT
+from com.sun.star.util.NumberFormat import DATE, TIME, CURRENCY, PERCENT
 
 IMPL_NAME = "org.offx.selectiontip.Job"
 
@@ -74,8 +79,8 @@ class _Hider(unohelper.Base, XCallback):
     def __init__(self, watcher):
         self.watcher = watcher
 
-    def notify(self, generation):
-        self.watcher.auto_hide(generation)
+    def notify(self, data):
+        self.watcher.auto_hide()
 
 
 class ViewWatcher(unohelper.Base, XSelectionChangeListener,
@@ -88,8 +93,12 @@ class ViewWatcher(unohelper.Base, XSelectionChangeListener,
         self.tip = None
         self.label = None
         self.last_key = None
-        self.generation = 0
+        self.formatter = None       # created only if a currency sum shows up
         self.async_cb = None
+        self.hider = None
+        self.deadline = None        # monotonic time to hide; None = hidden
+        self.timer = None           # the single auto-hide thread, if running
+        self.cond = threading.Condition()
         self.alive = True
         controller.addSelectionChangeListener(self)
         controller.addEnhancedMouseClickHandler(self)
@@ -137,34 +146,48 @@ class ViewWatcher(unohelper.Base, XSelectionChangeListener,
 
     def hide(self):
         self.last_key = None
+        self.deadline = None
         if self.tip is not None:
             try:
                 self.tip.setVisible(False)
             except Exception:
                 pass
 
-    def auto_hide(self, generation):
-        if self.alive and generation == self.generation:
+    def auto_hide(self):
+        # main thread: the deadline may have moved since the timer fired
+        if self.alive and self.deadline is not None \
+                and time.monotonic() >= self.deadline:
             self.hide()
 
     def _schedule_hide(self):
         if AUTO_HIDE_SECONDS <= 0:
             return
-        self.generation += 1
-        gen = self.generation
         if self.async_cb is None:
             self.async_cb = self.ctx.ServiceManager.createInstanceWithContext(
                 "com.sun.star.awt.AsyncCallback", self.ctx)
-        cb, hider = self.async_cb, _Hider(self)
+            self.hider = _Hider(self)
+        with self.cond:
+            self.deadline = time.monotonic() + AUTO_HIDE_SECONDS
+            if self.timer is None:      # otherwise the running one picks it up
+                self.timer = threading.Thread(target=self._wait_and_hide,
+                                              daemon=True)
+                self.timer.start()
 
-        def fire():
+    def _wait_and_hide(self):
+        """Timer thread: sleeps until the (possibly extended) deadline."""
+        with self.cond:
+            while self.alive and self.deadline is not None:
+                left = self.deadline - time.monotonic()
+                if left <= 0:
+                    break
+                self.cond.wait(left)
+            due = self.alive and self.deadline is not None
+            self.timer = None
+        if due:     # outside the lock: never call UNO while holding it
             try:
-                cb.addCallback(hider, gen)
+                self.async_cb.addCallback(self.hider, None)
             except Exception:
-                pass
-        t = threading.Timer(AUTO_HIDE_SECONDS, fire)
-        t.daemon = True
-        t.start()
+                _log(traceback.format_exc())
 
     # ------------------------------------------------------------- formatting
     @staticmethod
@@ -175,6 +198,47 @@ class ViewWatcher(unohelper.Base, XSelectionChangeListener,
             d = abs(d)                     # avoid "-0,00"
         s = "{:,.2f}".format(d)            # '1,234,567.89'
         return s.replace(",", "\x00").replace(".", ",").replace("\x00", ".")
+
+    @staticmethod
+    def _format_time(days):
+        """1.0625 -> '25:30'; does not wrap at 24h, seconds only if any."""
+        secs = int(abs(days) * 86400 + 0.5)
+        m, sec = divmod(secs, 60)
+        h, m = divmod(m, 60)
+        text = "{}{}:{:02d}".format("-" if days < 0 and secs else "", _int(h), m)
+        return text + ":{:02d}".format(sec) if sec else text
+
+    @staticmethod
+    def _reference_cell(sheet, a):
+        """Cell that defines the sum's format: the first one or, when that is
+        a header/empty, the next one (below; to the right in a single row)."""
+        cell = sheet.getCellByPosition(a.StartColumn, a.StartRow)
+        if cell.Type in (EMPTY, TEXT):
+            if a.EndRow > a.StartRow:
+                return sheet.getCellByPosition(a.StartColumn, a.StartRow + 1)
+            if a.EndColumn > a.StartColumn:
+                return sheet.getCellByPosition(a.StartColumn + 1, a.StartRow)
+        return cell
+
+    def _sum_text(self, sel, sheet, addr):
+        """Formatted sum, or None when it is meaningless (dates)."""
+        model = self.ctrl.Model
+        key = self._reference_cell(sheet, addr).NumberFormat
+        kind = model.NumberFormats.getByKey(key).Type
+        if kind & DATE:
+            return None
+        total = sel.computeFunction(SUM)
+        if kind & TIME:
+            return self._format_time(total)
+        if kind & PERCENT:
+            return self._format(total * 100) + "%"
+        if kind & CURRENCY:
+            if self.formatter is None:
+                self.formatter = self.ctx.ServiceManager.createInstanceWithContext(
+                    "com.sun.star.util.NumberFormatter", self.ctx)
+                self.formatter.attachNumberFormatsSupplier(model)
+            return self.formatter.convertNumberToString(key, total)
+        return self._format(total)
 
     # ---------------------------------------------------------------- geometry
     def _anchor_px(self, sheet, addr):
@@ -228,7 +292,9 @@ class ViewWatcher(unohelper.Base, XSelectionChangeListener,
         sheet = self.ctrl.ActiveSheet
         numbers = sel.computeFunction(COUNTNUMS)
         if numbers > 0:
-            text += "   Soma: " + self._format(sel.computeFunction(SUM))
+            total = self._sum_text(sel, sheet, addrs[0])
+            if total is not None:
+                text += "   Soma: " + total
 
         anchor = self._anchor_px(sheet, addrs[-1])
         if anchor is None:
@@ -259,8 +325,9 @@ class ViewWatcher(unohelper.Base, XSelectionChangeListener,
     def selectionChanged(self, ev):
         try:
             self.update()
-            _log("update: %r" % (self.label.getProperty("Text")
-                                 if self.tip and self.tip.isVisible() else None,))
+            if _LOG:
+                _log("update: %r" % (self.label.getProperty("Text")
+                     if self.tip and self.tip.isVisible() else None,))
         except Exception:
             _log(traceback.format_exc())
             self.hide()
@@ -291,7 +358,9 @@ class ViewWatcher(unohelper.Base, XSelectionChangeListener,
     def detach(self):
         if not self.alive:
             return
-        self.alive = False
+        with self.cond:
+            self.alive = False
+            self.cond.notify_all()      # let the timer thread end now
         for fn in (lambda: self.ctrl.removeSelectionChangeListener(self),
                    lambda: self.ctrl.removeEnhancedMouseClickHandler(self),
                    lambda: self.ctrl.Frame.ContainerWindow.removeTopWindowListener(self),
