@@ -96,6 +96,8 @@ class ViewWatcher(unohelper.Base, XSelectionChangeListener,
         self.formatter = None       # created only if a currency sum shows up
         self.async_cb = None
         self.hider = None
+        self.grid_key = None        # window geometry the cached origin is for
+        self.grid_pos = None        # grid origin, relative to the top frame
         self.deadline = None        # monotonic time to hide; None = hidden
         self.timer = None           # the single auto-hide thread, if running
         self.cond = threading.Condition()
@@ -241,23 +243,51 @@ class ViewWatcher(unohelper.Base, XSelectionChangeListener,
         return self._format(total)
 
     # ---------------------------------------------------------------- geometry
+    def _grid_origin(self, vs):
+        """Top-left of the grid in frame coordinates (what a child float
+        expects). Taken from the window tree, because the absolute position
+        in VisibleAreaOnScreen is unreliable on Wayland (stale frame offset).
+        Cached; the tree is only walked again when the layout changes."""
+        cp = self.ctrl.Frame.ComponentWindow.PosSize
+        key = (vs.X, vs.Y, vs.Width, vs.Height, cp.X, cp.Y, cp.Width, cp.Height)
+        if key == self.grid_key:
+            return self.grid_pos
+        found, focused = None, None
+        stack = [(self.ctrl.Frame.ComponentWindow, 0, 0, 0)]
+        while stack:
+            win, ox, oy, depth = stack.pop()
+            p = win.PosSize
+            x, y = ox + p.X, oy + p.Y
+            if depth and p.Width == vs.Width and p.Height == vs.Height:
+                found = found or (x, y)
+                try:
+                    if win.hasFocus():          # split view: the active pane
+                        focused = (x, y)
+                except Exception:
+                    pass
+            if depth < 3 and hasattr(win, "getWindows"):
+                stack.extend((c, x, y, depth + 1) for c in win.getWindows())
+        pos = focused or found
+        if pos is None:     # fallback: the old absolute-coordinate formula
+            top = self.ctrl.Frame.ContainerWindow.PosSize
+            pos = (vs.X - top.X, vs.Y - top.Y)
+            _log("grid window not found; using absolute coordinates")
+        self.grid_key, self.grid_pos = key, pos
+        return pos
+
     def _anchor_px(self, sheet, addr):
-        """Bottom-right corner of the range's last cell, in coordinates
-        relative to the top-level frame (what a child float expects)."""
+        """Bottom-right corner of the range's last cell, in frame coordinates.
+        Returns (x, y, grid_x, grid_y, grid_width, grid_height)."""
         va = self.ctrl.VisibleArea           # 1/100 mm
-        vs = self.ctrl.VisibleAreaOnScreen   # pixels
+        vs = self.ctrl.VisibleAreaOnScreen   # pixels (only the size is used)
         if va.Width <= 0 or va.Height <= 0:
             return None
+        gx, gy = self._grid_origin(vs)
         cell = sheet.getCellByPosition(addr.EndColumn, addr.EndRow)
         p, s = cell.Position, cell.Size
-        x_mm = p.X + s.Width
-        y_mm = p.Y + s.Height
-        sx = vs.Width / va.Width
-        sy = vs.Height / va.Height
-        x = vs.X + int((x_mm - va.X) * sx) + OFFSET_X
-        y = vs.Y + int((y_mm - va.Y) * sy) + OFFSET_Y
-        top = self.ctrl.Frame.ContainerWindow.PosSize
-        return x, y, vs, top
+        x = gx + int((p.X + s.Width - va.X) * vs.Width / va.Width) + OFFSET_X
+        y = gy + int((p.Y + s.Height - va.Y) * vs.Height / va.Height) + OFFSET_Y
+        return x, y, gx, gy, vs.Width, vs.Height
 
     # ------------------------------------------------------------------ update
     def update(self):
@@ -299,7 +329,7 @@ class ViewWatcher(unohelper.Base, XSelectionChangeListener,
         anchor = self._anchor_px(sheet, addrs[-1])
         if anchor is None:
             return self.hide()
-        x, y, vs, top = anchor
+        x, y, gx, gy, gw, gh = anchor
 
         self._ensure_tip()
         self.label.setProperty("Text", text)
@@ -309,11 +339,8 @@ class ViewWatcher(unohelper.Base, XSelectionChangeListener,
         self.label.setPosSize(PAD_X, PAD_Y, pref.Width, pref.Height, POSSIZE)
 
         # keep it inside the visible grid
-        x = max(vs.X, min(x, vs.X + vs.Width - w))
-        y = max(vs.Y, min(y, vs.Y + vs.Height - h))
-        # floating windows are positioned relative to the parent frame
-        x -= top.X
-        y -= top.Y
+        x = max(gx, min(x, gx + gw - w))
+        y = max(gy, min(y, gy + gh - h))
 
         self.tip.setPosSize(x, y, w, h, POSSIZE)
         if not self.tip.isVisible():

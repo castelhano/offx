@@ -28,8 +28,10 @@ Depois de instalar, reinicie o LibreOffice.
   - moeda: formato da própria célula (`R$ 3.703,70`);
   - data: só a contagem, sem soma;
   - demais: 2 casas e separador de milhar (`1.234,50`).
-- A posição vem de `VisibleArea` (1/100 mm) → `VisibleAreaOnScreen` (pixels),
-  ancorada no canto inferior direito da última célula, presa à área visível.
+- A posição converte `VisibleArea` (1/100 mm) para pixels pelo tamanho de
+  `VisibleAreaOnScreen`; a origem da grade vem da árvore de janelas (a posição
+  absoluta não é confiável no Wayland), com cache até o layout mudar. Ancorada
+  no canto inferior direito da última célula, presa à área visível.
 - O balão some ao clicar, ao trocar de janela, ao selecionar uma única célula
   ou após `AUTO_HIDE_SECONDS` (0 = não some sozinho).
 
